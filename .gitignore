@@ -4,6 +4,7 @@
 *.json
 *.parquet
 *.sql
+*.sqlite
 !tests/data/**/*.db
 !tests/data/**/*.csv
 !tests/data/**/*.json
@@ -11,6 +12,8 @@
 !tests/data/**/*.sql
 Pipfile
 snapshot_report.html
+.harlequin.toml
+.profiles
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -19,6 +22,7 @@ __pycache__/
 
 # C extensions
 *.so
+!tests/data/**/*.so
 
 # Distribution / packaging
 .Python

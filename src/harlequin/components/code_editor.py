@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 from typing import List, Union
 
@@ -8,16 +10,14 @@ from textual.binding import Binding
 from textual.css.query import NoMatches
 from textual.message import Message
 from textual.widgets import ContentSwitcher, TabbedContent, TabPane, Tabs
-from textual_textarea import TextArea, TextAreaSaved
-from textual_textarea.key_handlers import Cursor
-from textual_textarea.serde import serialize_lines
-from textual_textarea.textarea import TextInput
+from textual_textarea import TextAreaSaved, TextEditor
 
-from harlequin.cache import BufferState, load_cache
+from harlequin.autocomplete import MemberCompleter, WordCompleter
 from harlequin.components.error_modal import ErrorModal
+from harlequin.editor_cache import BufferState, load_cache
 
 
-class CodeEditor(TextArea):
+class CodeEditor(TextEditor):
     BINDINGS = [
         Binding(
             "ctrl+enter",
@@ -49,22 +49,40 @@ class CodeEditor(TextArea):
         if not semicolons:
             return self.text
 
-        before = Cursor(0, 0)
-        after: Union[None, Cursor] = None
+        before = (0, 0)
+        after: Union[None, tuple[int, int]] = None
         for c in semicolons:
-            if c <= self.cursor:
+            if c <= self.selection.end:
                 before = c
-            elif after is None and c > self.cursor:
+            elif after is None and c > self.selection.end:
                 after = c
                 break
         else:
-            after = Cursor(
-                len(self.text_input.lines) - 1, len(self.text_input.lines[-1]) - 1
-            )
-        lines, first, last = self.text_input._get_selected_lines(before, after)
-        lines[-1] = lines[-1][: last.pos]
-        lines[0] = lines[0][first.pos :]
-        return serialize_lines(lines)
+            lno = self.text_input.document.line_count - 1
+            after = (lno, len(self.text_input.document.get_line(lno)))
+        return self.text_input.get_text_range(
+            start=(before[0], before[1]), end=(after[0], after[1])
+        ).strip()
+
+    @property
+    def previous_query(self) -> str:
+        semicolons = self._semicolons
+
+        if not semicolons:
+            return self.text
+
+        first = (0, 0)
+        second = (0, 0)
+        for c in semicolons:
+            if c <= self.selection.end:
+                first = second
+                second = c
+            elif c > self.selection.end:
+                break
+
+        return self.text_input.get_text_range(
+            start=(first[0], first[1]), end=(second[0], second[1])
+        ).strip()
 
     def on_mount(self) -> None:
         self.post_message(EditorCollection.EditorSwitched(active_editor=self))
@@ -80,7 +98,7 @@ class CodeEditor(TextArea):
         if not self.has_shown_clipboard_error:
             self.app.notify(
                 "Could not access system clipboard.\n"
-                "See https://harlequin.sh/docs/troubleshooting#copying-and-pasting",
+                "See https://harlequin.sh/docs/troubleshooting/copying-and-pasting",
                 severity="error",
                 timeout=10,
             )
@@ -90,8 +108,7 @@ class CodeEditor(TextArea):
         self.post_message(self.Submitted(self.text))
 
     def action_format(self) -> None:
-        text_input = self.query_one(TextInput)
-        old_cursor = text_input.cursor
+        old_selection = self.text_input.selection
 
         try:
             self.text = format_string(self.text, Mode())
@@ -104,15 +121,14 @@ class CodeEditor(TextArea):
                 )
             )
         else:
-            text_input.move_cursor(old_cursor.pos, old_cursor.lno)
-            text_input.update(text_input._content)
+            self.text_input.selection = old_selection
 
     @property
-    def _semicolons(self) -> List[Cursor]:
-        semicolons: List[Cursor] = []
-        for i, line in enumerate(self.text_input.lines):
+    def _semicolons(self) -> list[tuple[int, int]]:
+        semicolons: list[tuple[int, int]] = []
+        for i, line in enumerate(self.text.splitlines()):
             for pos in [m.span()[1] for m in re.finditer(";", line)]:
-                semicolons.append(Cursor(i, pos))
+                semicolons.append((i, pos))
         return semicolons
 
 
@@ -139,7 +155,7 @@ class EditorCollection(TabbedContent):
         classes: Union[str, None] = None,
         disabled: bool = False,
         language: str = "sql",
-        theme: str = "monokai",
+        theme: str = "harlequin",
     ):
         super().__init__(
             *titles,
@@ -152,6 +168,8 @@ class EditorCollection(TabbedContent):
         self.language = language
         self.theme = theme
         self.counter = 0
+        self._word_completer: WordCompleter | None = None
+        self._member_completer: MemberCompleter | None = None
 
     @property
     def current_editor(self) -> CodeEditor:
@@ -172,8 +190,31 @@ class EditorCollection(TabbedContent):
         all_editors = content.query(CodeEditor)
         return list(all_editors)
 
+    @property
+    def member_completer(self) -> MemberCompleter | None:
+        return self._member_completer
+
+    @member_completer.setter
+    def member_completer(self, new_completer: MemberCompleter) -> None:
+        self._member_completer = new_completer
+        try:
+            self.current_editor.member_completer = new_completer
+        except NoMatches:
+            pass
+
+    @property
+    def word_completer(self) -> WordCompleter | None:
+        return self._word_completer
+
+    @word_completer.setter
+    def word_completer(self, new_completer: WordCompleter) -> None:
+        self._word_completer = new_completer
+        try:
+            self.current_editor.word_completer = new_completer
+        except NoMatches:
+            pass
+
     async def on_mount(self) -> None:
-        self.add_class("hide-tabs")
         cache = load_cache()
         if cache is not None:
             for _i, buffer in enumerate(cache.buffers):
@@ -184,6 +225,8 @@ class EditorCollection(TabbedContent):
         else:
             await self.action_new_buffer()
         self.query_one(Tabs).can_focus = False
+        self.current_editor.word_completer = self.word_completer
+        self.current_editor.member_completer = self.member_completer
 
     def on_focus(self) -> None:
         self.current_editor.focus()
@@ -193,13 +236,27 @@ class EditorCollection(TabbedContent):
     ) -> None:
         message.stop()
         self.post_message(self.EditorSwitched(active_editor=None))
+        self.current_editor.word_completer = self.word_completer
+        self.current_editor.member_completer = self.member_completer
         self.current_editor.focus()
 
-    async def action_new_buffer(self, state: Union[BufferState, None] = None) -> None:
+    async def insert_buffer_with_text(self, query_text: str) -> None:
+        new_editor = await self.action_new_buffer()
+        new_editor.text = query_text
+        new_editor.focus()
+
+    async def action_new_buffer(
+        self, state: Union[BufferState, None] = None
+    ) -> CodeEditor:
         self.counter += 1
         new_tab_id = f"tab-{self.counter}"
         editor = CodeEditor(
-            id=f"buffer-{self.counter}", language=self.language, theme=self.theme
+            id=f"buffer-{self.counter}",
+            text=state.text if state is not None else "",
+            language=self.language,
+            theme=self.theme,
+            word_completer=self.word_completer,
+            member_completer=self.member_completer,
         )
         pane = TabPane(
             f"Tab {self.counter}",
@@ -208,14 +265,16 @@ class EditorCollection(TabbedContent):
         )
         await self.add_pane(pane)
         if state is not None:
-            editor.text = state.text
-            editor.cursor = state.cursor
-            editor.selection_anchor = state.selection_anchor
+            editor.selection = state.selection
         else:
             self.active = new_tab_id
-            self.current_editor.focus()
+            try:
+                self.current_editor.focus()
+            except NoMatches:
+                pass
         if self.counter > 1:
             self.remove_class("hide-tabs")
+        return editor
 
     def action_close_buffer(self) -> None:
         if self.tab_count > 1:

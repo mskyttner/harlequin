@@ -1,20 +1,16 @@
-from typing import Dict, List, Union
+from typing import List, Tuple, Union
 
-import pyarrow as pa
-from rich.text import Text
-from textual.app import ComposeResult
+from rich.markup import escape
 from textual.binding import Binding
 from textual.css.query import NoMatches
-from textual.reactive import reactive
-from textual.widget import Widget
 from textual.widgets import (
     ContentSwitcher,
-    LoadingIndicator,
     TabbedContent,
     TabPane,
     Tabs,
 )
 from textual_fastdatatable import DataTable
+from textual_fastdatatable.backend import AutoBackendType
 
 
 class ResultsTable(DataTable):
@@ -26,50 +22,35 @@ class ResultsTable(DataTable):
     """
 
 
-class ResultsViewer(ContentSwitcher, can_focus=True):
+class ResultsViewer(TabbedContent, can_focus=True):
     BINDINGS = [
         Binding("j", "switch_tab(-1)", "Previous Tab", show=False),
         Binding("k", "switch_tab(1)", "Next Tab", show=False),
     ]
 
-    data: reactive[Dict[str, pa.Table]] = reactive(dict)
-
-    TABBED_ID = "tabs"
-    LOADING_ID = "loading"
+    BORDER_TITLE = "Query Results"
 
     def __init__(
         self,
-        *children: Widget,
-        name: Union[str, None] = None,
-        id: Union[str, None] = None,  # noqa A002
-        classes: Union[str, None] = None,
-        disabled: bool = False,
-        initial: Union[str, None] = None,
         max_results: int = 10_000,
         type_color: str = "#888888",
     ) -> None:
-        super().__init__(
-            *children,
-            name=name,
-            id=id,
-            classes=classes,
-            disabled=disabled,
-            initial=initial,
-        )
-        self.MAX_RESULTS = max_results
+        super().__init__()
+        self.max_results = max_results
         self.type_color = type_color
 
-    def compose(self) -> ComposeResult:
-        yield TabbedContent(id=self.TABBED_ID)
-        yield LoadingIndicator(id=self.LOADING_ID)
+    def on_mount(self) -> None:
+        self.query_one(Tabs).can_focus = False
+        self.add_class("hide-tabs")
+        self.max_col_width = self._get_max_col_width()
 
     def clear_all_tables(self) -> None:
-        self.tab_switcher.clear_panes()
+        self.clear_panes()
         self.add_class("hide-tabs")
 
     def get_visible_table(self) -> Union[ResultsTable, None]:
-        content = self.tab_switcher.query_one(ContentSwitcher)
-        active_tab_id = self.tab_switcher.active
+        content = self.query_one(ContentSwitcher)
+        active_tab_id = self.active
         if active_tab_id:
             try:
                 tab_pane = content.query_one(f"#{active_tab_id}", TabPane)
@@ -81,95 +62,93 @@ class ResultsViewer(ContentSwitcher, can_focus=True):
             try:
                 return tables.first(ResultsTable)
             except NoMatches:
+                self.log("NO TABLES FOUND")
                 return None
 
-    def push_table(
+    async def push_table(
         self,
         table_id: str,
-        column_labels: Union[List[Union[str, Text]], None],
-        data: pa.Table,
-    ) -> None:
-        table = ResultsTable(id=table_id, column_labels=column_labels, data=data)
-        n = self.tab_switcher.tab_count + 1
+        column_labels: List[Tuple[str, str]],
+        data: AutoBackendType,
+    ) -> ResultsTable:
+        formatted_labels = [
+            self._format_column_label(col_name, col_type)
+            for col_name, col_type in column_labels
+        ]
+        table = ResultsTable(
+            id=table_id,
+            column_labels=formatted_labels,  # type: ignore
+            data=data,
+            max_rows=self.max_results,
+            cursor_type="range",
+            max_column_content_width=self.max_col_width,
+            null_rep="[dim]∅ null[/]",
+        )
+        n = self.tab_count + 1
         if n > 1:
             self.remove_class("hide-tabs")
         pane = TabPane(f"Result {n}", table)
-        self.tab_switcher.add_pane(pane)
+        await self.add_pane(pane)
+        self.active = f"tab-{n}"
+        # need to manually refresh the table, since activating the tab
+        # doesn't consistently cause a new layout calc.
+        table.refresh(repaint=True, layout=True)
+        return table
 
-    async def set_not_responsive(self, data: Dict[str, pa.Table]) -> None:
-        if len(data) > 1:
-            self.border_title = f"Loading Data from {len(data):,} Queries."
-        elif data:
-            self.border_title = (
-                f"Loading Data {self._human_row_count(next(iter(data.values())))}."
-            )
+    def show_loading(self) -> None:
+        self.border_title = "Running Query"
         self.add_class("non-responsive")
+        self.loading = True
+        self.clear_all_tables()
 
-    def set_responsive(
-        self,
-        data: Union[Dict[str, pa.Table], None] = None,
-        did_run: bool = True,
-    ) -> None:
+    def show_table(self, did_run: bool = True) -> None:
+        self.loading = False
+        self.remove_class("non-responsive")
         if not did_run:
             self.border_title = "Query Results"
-        elif data is None:
-            self.border_title = "Query Returned No Records"
         else:
             table = self.get_visible_table()
             if table is not None:
-                id_ = table.id
-                assert id_ is not None
-                self.border_title = f"Query Results {self._human_row_count(data[id_])}"
+                rows = table.source_row_count
+                if rows > 0:
+                    self.border_title = (
+                        f"Query Results {self._human_row_count(table.source_row_count)}"
+                    )
+                else:
+                    self.border_title = "Query Returned No Records"
             else:
-                self.border_title = (
-                    f"Query Results {self._human_row_count(next(iter(data.values())))}"
-                )
-        self.remove_class("non-responsive")
-
-    def show_loading(self) -> None:
-        self.current = self.LOADING_ID
-        self.border_title = "Running Query"
-        self.add_class("non-responsive")
-
-    def show_table(self) -> None:
-        self.current = self.TABBED_ID
-
-    def on_mount(self) -> None:
-        self.border_title = "Query Results"
-        self.current = self.TABBED_ID
-        self.tab_switcher = self.query_one(TabbedContent)
-        self.loading_spinner = self.query_one(LoadingIndicator)
-        self.query_one(Tabs).can_focus = False
+                self.border_title = "Query Results"
 
     def on_focus(self) -> None:
         self._focus_on_visible_table()
+
+    def on_resize(self) -> None:
+        # only impacts new tables pushed after the resize
+        self.max_col_width = self._get_max_col_width()
 
     def on_tabbed_content_tab_activated(
         self, message: TabbedContent.TabActivated
     ) -> None:
         message.stop()
-        # Don't update the border if we're still loading the table.
-        if self.border_title and str(self.border_title).startswith("Loading"):
-            return
         maybe_table = self.get_visible_table()
-        if maybe_table is not None and self.data:
-            id_ = maybe_table.id
-            assert id_ is not None
-            self.border_title = f"Query Results {self._human_row_count(self.data[id_])}"
+        if maybe_table is not None:
+            self.border_title = (
+                f"Query Results {self._human_row_count(maybe_table.source_row_count)}"
+            )
             maybe_table.focus()
 
     def action_switch_tab(self, offset: int) -> None:
-        if not self.tab_switcher.active:
+        if not self.active:
             return
-        tab_number = int(self.tab_switcher.active.split("-")[1])
+        tab_number = int(self.active.split("-")[1])
         unsafe_tab_number = tab_number + offset
         if unsafe_tab_number < 1:
-            new_tab_number = self.tab_switcher.tab_count
-        elif unsafe_tab_number > self.tab_switcher.tab_count:
+            new_tab_number = self.tab_count
+        elif unsafe_tab_number > self.tab_count:
             new_tab_number = 1
         else:
             new_tab_number = unsafe_tab_number
-        self.tab_switcher.active = f"tab-{new_tab_number}"
+        self.active = f"tab-{new_tab_number}"
         self._focus_on_visible_table()
 
     def _focus_on_visible_table(self) -> None:
@@ -177,9 +156,17 @@ class ResultsViewer(ContentSwitcher, can_focus=True):
         if maybe_table is not None:
             maybe_table.focus()
 
-    def _human_row_count(self, data: pa.Table) -> str:
-        total_rows = data.num_rows
-        if self.MAX_RESULTS > 0 and total_rows > self.MAX_RESULTS:
-            return f"(Showing {self.MAX_RESULTS:,} of {total_rows:,} Records)"
+    def _human_row_count(self, total_rows: int) -> str:
+        if self.max_results > 0 and total_rows > self.max_results:
+            return f"(Showing {self.max_results:,} of {total_rows:,} Records)"
         else:
             return f"({total_rows:,} Records)"
+
+    def _format_column_label(self, col_name: str, col_type: str) -> str:
+        return f"{escape(col_name)} [{self.type_color}]{escape(col_type)}[/]"
+
+    def _get_max_col_width(self) -> int:
+        SMALLEST_MAX_WIDTH = 20
+        CELL_X_PADDING = 2
+        parent_size = getattr(self.parent, "container_size", self.screen.container_size)
+        return max(SMALLEST_MAX_WIDTH, parent_size.width // 2 - CELL_X_PADDING)

@@ -1,52 +1,42 @@
-from pathlib import Path
+from unittest.mock import MagicMock
 
-import duckdb
 import pytest
-from harlequin import Harlequin
 
 
 @pytest.fixture(autouse=True)
-def mock_user_cache_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    monkeypatch.setattr("harlequin.cache.user_cache_dir", lambda **_: tmp_path)
-    return tmp_path
+def no_use_buffer_cache(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    if "use_cache" in request.keywords:
+        return
+    monkeypatch.setattr("harlequin.components.code_editor.load_cache", lambda: None)
+    monkeypatch.setattr("harlequin.app.write_editor_cache", lambda *_: None)
+
+
+@pytest.fixture(autouse=True)
+def no_use_catalog_cache(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    if "use_cache" in request.keywords:
+        return
+    monkeypatch.setattr("harlequin.app.get_catalog_cache", lambda *_: None)
+    monkeypatch.setattr("harlequin.app.update_catalog_cache", lambda *_: None)
+
+
+@pytest.fixture(autouse=True)
+def mock_config_loader(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("harlequin.cli.get_config_for_profile", lambda **_: dict())
 
 
 @pytest.fixture
-def tiny_db(tmp_path: Path, data_dir: Path) -> Path:
-    """
-    Creates a duckdb database file from the contents of
-    data_dir/functional_tests/tiny
-    """
-    path_to_data = data_dir / "functional_tests" / "tiny"
-    path_to_db = tmp_path / "tiny.db"
-    conn = duckdb.connect(str(path_to_db))
-    conn.execute(f"import database '{path_to_data}';")
-    return path_to_db
+def mock_pyperclip(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    mock = MagicMock()
+    mock.determine_clipboard.return_value = mock.copy, mock.paste
 
+    def set_paste(x: str) -> None:
+        mock.paste.return_value = x
 
-@pytest.fixture
-def small_db(tmp_path: Path, data_dir: Path) -> Path:
-    """
-    Creates a duckdb database file from the contents of
-    data_dir/functional_tests/small
-    """
-    path_to_data = data_dir / "functional_tests" / "small"
-    path_to_db = tmp_path / "small.db"
-    conn = duckdb.connect(str(path_to_db))
-    conn.execute(f"import database '{path_to_data}';")
-    return path_to_db
+    mock.copy.side_effect = set_paste
+    monkeypatch.setattr("textual_textarea.text_editor.pyperclip", mock)
 
-
-@pytest.fixture
-def app() -> Harlequin:
-    return Harlequin([":memory:"])
-
-
-@pytest.fixture
-def app_small_db(small_db: Path) -> Harlequin:
-    return Harlequin([str(small_db)])
-
-
-@pytest.fixture
-def app_multi_db(tiny_db: Path, small_db: Path) -> Harlequin:
-    return Harlequin([str(tiny_db), str(small_db)])
+    return mock
